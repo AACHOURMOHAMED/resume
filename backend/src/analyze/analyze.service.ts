@@ -4,6 +4,13 @@ import OpenAI from 'openai';
 import { File as MulterFile } from 'multer';
 import { AnalyzeRequestDto } from './dto/analyze-request.dto';
 import { AnalyzeResponseDto } from './dto/analyze-response.dto';
+import {
+  buildFallback,
+  buildPrompt,
+  normalizeList,
+  normalizeScore,
+  normalizeWeights,
+} from './helpers/analyze-helpers';
 
 @Injectable()
 export class AnalyzeService {
@@ -41,7 +48,7 @@ export class AnalyzeService {
       return this.buildFallback('OpenAI credentials are not configured.');
     }
 
-    const prompt = this.buildPrompt(resumeText, jobText);
+    const prompt = buildPrompt(resumeText, jobText);
     this.logger.debug(`[analyze] Prompt length: ${prompt.length} chars`);
     this.logger.debug(`[analyze] Prompt preview (first 200 chars): ${prompt.substring(0, 200)}...`);
 
@@ -133,38 +140,6 @@ export class AnalyzeService {
   /**
    * Build the structured prompt instructing the model to respond with strict JSON.
    */
-  private buildPrompt(resumeText: string, jobText: string): string {
-    return [
-      'You are an expert technical recruiter.',
-      'Compare the resume and job description below.',
-      '',
-      'Return ONLY valid JSON in this exact format:',
-      '{',
-      '  "score": number,',
-      '  "pros": string[],',
-      '  "cons": string[],',
-      '  "tips": string[],',
-      '  "weights": {',
-      '    "skills": number,',
-      '    "experience": number,',
-      '    "education": number',
-      '  }',
-      '}',
-      '',
-      'Rules:',
-      '- score: 0-100 match.',
-      '- pros/cons: concise bullet strings.',
-      '- tips: actionable next steps.',
-      '- weights: percentage contributions (0-100) for skills, experience, education; they should sum near 100.',
-      '',
-      'Resume:',
-      resumeText,
-      '',
-      'Job Description:',
-      jobText,
-    ].join('\n');
-  }
-
   /**
    * Parse and normalize the model response to the expected shape.
    */
@@ -185,11 +160,11 @@ export class AnalyzeService {
       );
 
       const normalized = {
-        score: this.normalizeScore(parsed.score),
-        pros: this.normalizeList(parsed.pros),
-        cons: this.normalizeList(parsed.cons),
-        tips: this.normalizeList(parsed.tips),
-        weights: this.normalizeWeights(parsed.weights),
+        score: normalizeScore(parsed.score),
+        pros: normalizeList(parsed.pros),
+        cons: normalizeList(parsed.cons),
+        tips: normalizeList(parsed.tips),
+        weights: normalizeWeights(parsed.weights),
       };
 
       this.logger.debug(
@@ -198,115 +173,18 @@ export class AnalyzeService {
 
       return normalized;
     } catch (error) {
-      this.logger.warn(
-        '[parseResponse] Failed to parse JSON from OpenAI response.',
-        (error as Error)?.stack ?? String(error),
-      );
-      this.logger.debug(`[parseResponse] Failed content was: ${content.substring(0, 500)}`);
+        this.logger.warn(
+          '[parseResponse] Failed to parse JSON from OpenAI response.',
+          (error as Error)?.stack ?? String(error),
+        );
+        this.logger.debug(`[parseResponse] Failed content was: ${content.substring(0, 500)}`);
       return null;
     }
   }
 
-  private normalizeScore(value: unknown): number {
-    const originalType = typeof value;
-    const asNumber =
-      typeof value === 'number'
-        ? value
-        : typeof value === 'string' && value.trim() !== ''
-          ? Number(value)
-          : Number.NaN;
-
-    if (Number.isNaN(asNumber)) {
-      this.logger.warn(
-        `[normalizeScore] Invalid score value: ${value} (type: ${originalType}), defaulting to 0`,
-      );
-      return 0;
-    }
-
-    const clamped = Math.max(0, Math.min(100, asNumber));
-    const rounded = Math.round(clamped);
-    if (rounded !== asNumber) {
-      this.logger.debug(
-        `[normalizeScore] Clamped score from ${asNumber} to ${rounded}`,
-      );
-    }
-    return rounded;
-  }
-
-  private normalizeList(value: unknown): string[] {
-    if (!Array.isArray(value)) {
-      this.logger.warn(
-        `[normalizeList] Value is not an array (type: ${typeof value}), returning empty array`,
-      );
-      return [];
-    }
-
-    const originalLength = value.length;
-    const normalized = value
-      .map((item) => (typeof item === 'string' ? item.trim() : null))
-      .filter((item): item is string => Boolean(item));
-
-    if (normalized.length !== originalLength) {
-      this.logger.debug(
-        `[normalizeList] Filtered array from ${originalLength} to ${normalized.length} items`,
-      );
-    }
-
-    return normalized;
-  }
-
-  private normalizeWeights(value: unknown): AnalyzeResponseDto['weights'] {
-    const fallback = { skills: 0, experience: 0, education: 0 };
-    if (
-      !value ||
-      typeof value !== 'object' ||
-      Array.isArray(value) ||
-      value === null
-    ) {
-      this.logger.warn(
-        `[normalizeWeights] Value is not an object; returning zeros (type: ${typeof value})`,
-      );
-      return fallback;
-    }
-
-    const asRecord = value as Record<string, unknown>;
-    const normalizeNumber = (n: unknown, key: string): number => {
-      const num =
-        typeof n === 'number'
-          ? n
-          : typeof n === 'string' && n.trim() !== ''
-            ? Number(n)
-            : Number.NaN;
-      if (Number.isNaN(num)) {
-        this.logger.warn(`[normalizeWeights] Invalid number for ${key}, defaulting to 0`);
-        return 0;
-      }
-      const clamped = Math.max(0, Math.min(100, num));
-      const rounded = Math.round(clamped);
-      if (rounded !== num) {
-        this.logger.debug(`[normalizeWeights] Clamped ${key} from ${num} to ${rounded}`);
-      }
-      return rounded;
-    };
-
-    return {
-      skills: normalizeNumber(asRecord.skills, 'skills'),
-      experience: normalizeNumber(asRecord.experience, 'experience'),
-      education: normalizeNumber(asRecord.education, 'education'),
-    };
-  }
-
   private buildFallback(reason: string): AnalyzeResponseDto {
     this.logger.warn(`[buildFallback] Creating fallback response - reason: ${reason}`);
-    const fallback = {
-      score: 0,
-      pros: [],
-      cons: ['Automatic fallback used.', reason].filter(Boolean),
-      tips: [
-        'Retry shortly or provide more detail in the resume and job description.',
-      ],
-      weights: { skills: 0, experience: 0, education: 0 },
-    };
+    const fallback = buildFallback(reason);
     this.logger.debug(
       `[buildFallback] Fallback response - score: ${fallback.score}, cons: ${fallback.cons.length}, tips: ${fallback.tips.length}`,
     );
